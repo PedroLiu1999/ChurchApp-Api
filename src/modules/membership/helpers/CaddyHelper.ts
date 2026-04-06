@@ -39,15 +39,21 @@ export class CaddyHelper {
     const results: string[] = [];
 
     try {
-      // Configure S3 storage for certificates
-      await this.putConfig(baseUrl + "/config/storage", {
-        module: "s3",
-        bucket: "churchapps-caddy-certs",
-        region: "us-east-2",
-        prefix: "certs"
-      });
-      results.push("storage: ok");
-      await this.sleep(500); // Let Caddy stabilize after storage change
+      // Configure cert storage — S3 if CADDY_CERT_BUCKET is set, otherwise use Caddy's default local storage
+      const certBucket = process.env.CADDY_CERT_BUCKET || "";
+      if (certBucket) {
+        await this.putConfig(baseUrl + "/config/storage", {
+          module: "s3",
+          bucket: certBucket,
+          region: process.env.AWS_REGION || "us-east-1",
+          prefix: process.env.CADDY_CERT_PREFIX || "certs",
+          ...(process.env.AWS_ENDPOINT_URL_S3 ? { endpoint: process.env.AWS_ENDPOINT_URL_S3 } : {})
+        });
+        results.push("storage: ok (s3)");
+        await this.sleep(500);
+      } else {
+        results.push("storage: ok (local file)");
+      }
 
       // Configure TLS automation with ACME email for Let's Encrypt
       await this.putConfig(baseUrl + "/config/apps/tls/automation/policies", [
@@ -55,7 +61,7 @@ export class CaddyHelper {
           issuers: [
             {
               module: "acme",
-              email: "support@livecs.org"
+              email: process.env.CADDY_ACME_EMAIL || process.env.SUPPORT_EMAIL || ""
             }
           ]
         }
@@ -63,39 +69,44 @@ export class CaddyHelper {
       results.push("tls: ok");
       await this.sleep(500);
 
-      // Create proxy server on :443 with empty routes (will be populated by updateCaddy)
-      await this.putConfig(baseUrl + "/config/apps/http/servers/proxy", {
-        listen: [":443"],
-        routes: []
-      });
-      results.push("proxy: ok");
-      await this.sleep(500);
+      // When running alongside a Caddyfile, Caddy already has srv0 on :443 and handles HTTP→HTTPS.
+      // We only need TLS config (done above). Skip creating proxy/redirect servers.
+      // If no Caddyfile is used, create the servers:
+      try {
+        const existingConfig = await axios.get(baseUrl + "/config/apps/http/servers/srv0", { timeout: 5000 });
+        if (existingConfig.data) {
+          results.push("proxy: skipped (Caddyfile srv0 exists)");
+          results.push("http_redirect: skipped (Caddyfile manages)");
+        }
+      } catch {
+        // No srv0 — create proxy and redirect servers from scratch
+        await this.putConfig(baseUrl + "/config/apps/http/servers/proxy", {
+          listen: [":443"],
+          routes: []
+        });
+        results.push("proxy: ok (created)");
+        await this.sleep(500);
 
-      // Create HTTP to HTTPS redirect server on :80
-      await this.putConfig(baseUrl + "/config/apps/http/servers/http_redirect", {
-        listen: [":80"],
-        routes: [
-          {
-            match: [{ path: ["/.well-known/acme-challenge/*"] }],
-            handle: [
-              {
-                handler: "static_response",
-                status_code: 200
-              }
-            ]
-          },
-          {
-            handle: [
-              {
-                handler: "static_response",
-                status_code: 308,
-                headers: { Location: ["https://{http.request.host}{http.request.uri}"] }
-              }
-            ]
-          }
-        ]
-      });
-      results.push("http_redirect: ok");
+        await this.putConfig(baseUrl + "/config/apps/http/servers/http_redirect", {
+          listen: [":80"],
+          routes: [
+            {
+              match: [{ path: ["/.well-known/acme-challenge/*"] }],
+              handle: [{ handler: "static_response", status_code: 200 }]
+            },
+            {
+              handle: [
+                {
+                  handler: "static_response",
+                  status_code: 308,
+                  headers: { Location: ["https://{http.request.host}{http.request.uri}"] }
+                }
+              ]
+            }
+          ]
+        });
+        results.push("http_redirect: ok (created)");
+      }
 
       return { success: true, results };
     } catch (err: any) {
@@ -108,13 +119,36 @@ export class CaddyHelper {
     }
   }
 
-  // Updates only the routes array on the proxy server - safe to call repeatedly
+  // Updates routes on the active server — appends dynamic domain routes
   static async updateCaddy() {
     if (!Environment.caddyHost || !Environment.caddyPort) return;
 
-    const adminUrl = this.getAdminBaseUrl() + "/config/apps/http/servers/proxy/routes";
-    const routes = await this.generateRoutes();
-    await axios.patch(adminUrl, routes);
+    // Determine server name: srv0 (Caddyfile) or proxy (programmatic)
+    const baseUrl = this.getAdminBaseUrl();
+    let serverName = "proxy";
+    try {
+      await axios.get(baseUrl + "/config/apps/http/servers/srv0", { timeout: 5000 });
+      serverName = "srv0";
+    } catch { /* srv0 doesn't exist, use proxy */ }
+
+    const adminUrl = baseUrl + `/config/apps/http/servers/${serverName}/routes`;
+    const existingRoutes = await axios.get(adminUrl, { timeout: 10000 }).then(r => r.data).catch(() => []);
+    const dynamicRoutes = await this.generateRoutes();
+
+    // Filter out existing dynamic routes (non-Caddyfile routes that have terminal: true and reverse_proxy with tls transport)
+    const staticRoutes = (existingRoutes || []).filter((r: any) => {
+      const handler = r?.handle?.[0];
+      if (handler?.handler === "subroute") {
+        const innerHandler = handler?.routes?.[0]?.handle?.[0];
+        // Dynamic routes use tls transport; Caddyfile routes don't
+        return !innerHandler?.transport?.tls;
+      }
+      return true;
+    });
+
+    // Append dynamic routes after static Caddyfile routes
+    const combined = [...staticRoutes, ...dynamicRoutes];
+    await axios.patch(adminUrl, combined);
   }
 
   // Generates the full routes array from the database

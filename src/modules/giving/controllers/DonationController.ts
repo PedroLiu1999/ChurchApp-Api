@@ -18,8 +18,8 @@ export class DonationController extends GivingBaseController {
       let error = "";
       try {
         await EmailHelper.sendEmail({
-          from: "support@churchapps.org",
-          to: "jeremy@livecs.org",
+          from: process.env.SMTP_FROM || process.env.SUPPORT_EMAIL || "noreply@example.com",
+          to: process.env.SUPPORT_EMAIL || process.env.SMTP_FROM || "noreply@example.com",
           subject: "Test Email",
           body: "Test Email"
         });
