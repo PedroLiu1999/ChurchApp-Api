@@ -1,0 +1,63 @@
+# Dependencies (re-installed inside the image)
+node_modules/
+layer/
+layers/
+
+# Compiled output (re-built inside the image)
+dist/
+build/
+out/
+
+# Environment / secrets – inject at runtime, never bake into the image
+.env
+.env.*
+!.env.sample
+
+# Dev tooling
+.github/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artefacts
+coverage/
+.nyc_output/
+reports/
+test-results/
+jest_html_reporters.html
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Serverless / Lambda artefacts (not needed for Docker)
+.serverless/
+.webpack/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Certificates
+*.pem
+*.key
+*.crt
+
+# Git
+.git/
+.gitattributes
+.gitignore
+
+# Docs
+README.md
+*.md
+LICENSE
+
+# Playground source (excluded from prod build)
+src/playground/
